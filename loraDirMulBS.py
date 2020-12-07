@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
  LoRaSim 0.2.1: simulate collisions in LoRa - multiple base stations variant
@@ -34,6 +34,7 @@
         3   optimise the setting per node based on the distance to the gateway.
         4   use the settings as defined in LoRaWAN (SF12, BW125, CR4/5).
         5   similair to experiment 3, but also optimises the transmit power.
+        6   use sf7, bw125k, cr=4/5.
     simtime
         total running time in milliseconds
     basestation
@@ -65,16 +66,20 @@ graphics = 0
 # do the full collision check
 full_collision = False
 
+packetlen = 20
+downRate=10 #下行比率10%
 # experiments:
 # 0: packet with longest airtime, aloha-style experiment
 # 0: one with 3 frequencies, 1 with 1 frequency
 # 2: with shortest packets, still aloha-style
 # 3: with shortest possible packets depending on distance
+# 4: with bw125k, cr: 4/5, band470Mhz
 
 
 
 # this is an array with measured values for sensitivity
 # see paper, Table 3
+#sf, bw125, bw250, bw500
 sf7 = np.array([7,-126.5,-124.25,-120.75])
 sf8 = np.array([8,-127.25,-126.75,-124.0])
 sf9 = np.array([9,-131.25,-128.25,-127.5])
@@ -82,6 +87,19 @@ sf10 = np.array([10,-132.75,-130.25,-128.75])
 sf11 = np.array([11,-134.5,-132.75,-128.75])
 sf12 = np.array([12,-133.25,-132.25,-132.25])
 
+sf_distance = []
+
+txpwr=14#dbm
+freq=470
+alpha=4
+#add by zhengry 添加每个rssi所对应的距离
+rssi_list =[-123, -126,-129, -132, -134.5, -137]
+for i in range (len(rssi_list)):
+    # ln = ((p0*fc^2*10^(-2.8))/rssi)^(1/alpha)
+    tmp = math.pow(10, txpwr/10) / (math.pow(freq, 2)*math.pow(10,-2.8)* math.pow(10, rssi_list[i]/10))
+    sf_distance.append(math.pow(tmp, 1/alpha))
+
+print("SF_Distance: ", sf_distance)
 #
 # check for collisions at base station
 # Note: called before a packet (or rather node) is inserted into the list
@@ -195,11 +213,15 @@ def airtime(sf,cr,pl,bw):
 #
 # this function creates a BS
 #
+#创建基站，并放置
 class myBS():
     def __init__(self, id):
         self.id = id
         self.x = 0
         self.y = 0
+        #是否处于发送状态
+        self.txState = 0
+        self.txTime =0
 
         # This is a hack for now
         global nrBS
@@ -252,7 +274,7 @@ class myBS():
                 self.y = 3*maxY/4.0
 
 
-        print "BSx:", self.x, "BSy:", self.y
+        print("BSx:",self.x, "BSy:",self.y)
 
         global graphics
         if (graphics):
@@ -274,30 +296,35 @@ class myNode():
         self.y = 0
         self.packet = []
         self.dist = []
+        self.sf = 12
         # this is very complex prodecure for placing nodes
         # and ensure minimum distance between each pair of nodes
         found = 0
         rounds = 0
         global nodes
+        #生成终端位置过程，需要确保节点间的距离>10m
         while (found == 0 and rounds < 100):
             global maxX
             global maxY
+            #生成一个随机点位
             posx = random.randint(0,int(maxX))
             posy = random.randint(0,int(maxY))
             if len(nodes) > 0:
                 for index, n in enumerate(nodes):
                     dist = np.sqrt(((abs(n.x-posx))**2)+((abs(n.y-posy))**2))
+                    #距离已有节点的距离>10，则found = 1，但继续遍历
                     if dist >= 10:
                         found = 1
                         self.x = posx
                         self.y = posy
                     else:
+                        #这里应该要对found赋值为0吧。。。
                         rounds = rounds + 1
                         if rounds == 100:
-                            print "could not place new node, giving up"
+                            print("could not place new node, giving up")
                             exit(-2)
             else:
-                print "first node"
+                print("first node")
                 self.x = posx
                 self.y = posy
                 found = 1
@@ -305,12 +332,21 @@ class myNode():
 
         # create "virtual" packet for each BS
         global nrBS
+        #计算节点到每个基站的距离
+        longdist = 0
         for i in range(0,nrBS):
             d = np.sqrt((self.x-bs[i].x)*(self.x-bs[i].x)+(self.y-bs[i].y)*(self.y-bs[i].y))
             self.dist.append(d)
             self.packet.append(myPacket(self.id, packetlen, self.dist[i], i))
-        print('node %d' %id, "x", self.x, "y", self.y, "dist: ", self.dist)
+            if longdist < d:
+                longdist = d
 
+        for i in range (len(sf_distance)):
+            if (longdist < sf_distance[i]):
+                self.sf = i+7
+
+        
+        #print('node %d' %id, "[x,y]:[", self.x,",", self.y, "],dist: ", self.dist,",SF:", self.sf)
         self.sent = 0
 
         # graphics for node
@@ -323,6 +359,7 @@ class myNode():
 # this function creates a packet (associated with a node)
 # it also sets all parameters, currently random
 #
+#生成一个节点相关报文，并且对其参数赋值，包括：频点、rssi、bs等
 class myPacket():
     def __init__(self, nodeid, plen, distance, bs):
         global experiment
@@ -332,7 +369,8 @@ class myPacket():
         global var
         global Lpld0
         global GL
-
+        self.lost = 0
+        self.withdownlink = 0
 
         # new: base station ID
         self.bs = bs
@@ -353,6 +391,11 @@ class myPacket():
             self.sf = 6
             self.cr = 1
             self.bw = 500
+        if experiment==6:
+            if (nodeid < len(nodes)):
+                self.sf = nodes[nodeid].sf
+            self.cr = 1
+            self.bw = 125
 
 
         # for experiment 3 find the best setting
@@ -360,54 +403,62 @@ class myPacket():
         Prx = Ptx  ## zero path loss by default
 
         # log-shadow
-        Lpl = Lpld0 + 10*gamma*math.log10(distance/d0)
-        print Lpl
+        Lpl = Lpld0 + 10*gamma*math.log10(distance/d0) #不需要加上随机噪声嘛？
+        print("Lpl:", Lpl)
         Prx = Ptx - GL - Lpl
 
         if (experiment == 3):
             minairtime = 9999
             minsf = 0
             minbw = 0
-
-            for i in range(0,6):
-                for j in range(1,4):
-                    if (sensi[i,j] < Prx):
-                        self.sf = sensi[i,0]
-                        if j==1:
-                            self.bw = 125
-                        elif j==2:
-                            self.bw = 250
-                        else:
-                            self.bw=500
-                        at = airtime(self.sf,4,20,self.bw)
-                        if at < minairtime:
-                            minairtime = at
-                            minsf = self.sf
-                            minbw = self.bw
-
+        #遍历查询可使用的速率和功率
+            for i in range(1,6):
+                #for j in range(1,4):
+                j = 1
+                #print("Get sensi[",i,"]:", sensi[i,j], ", Prx:", Prx)
+                if (sensi[i,j] < Prx):
+                    self.sf = sensi[i,0]
+                    if j==1:
+                        self.bw = 125
+                    elif j==2:
+                        self.bw = 250
+                    else:
+                        self.bw=500
+                    at = airtime(self.sf,4,20,self.bw)
+                    
+                    #print("nodeid", self.nodeid, ",toa:", at)
+                    if at < minairtime:
+                        minairtime = at
+                        minsf = self.sf
+                        minbw = self.bw
+            #给节点分配最快的参数配置:sf, bw
             self.rectime = minairtime
             self.sf = minsf
             self.bw = minbw
             if (minairtime == 9999):
-                print "does not reach base station"
+                print("does not reach base station")
                 exit(-1)
-
         # transmission range, needs update XXX
         self.transRange = 150
         self.pl = plen
+        #符号时间？
         self.symTime = (2.0**self.sf)/self.bw
         self.arriveTime = 0
         self.rssi = Prx
         # frequencies: lower bound + number of 61 Hz steps
-        self.freq = 860000000 + random.randint(0,2622950)
-
+        #self.freq = 860000000 + random.randint(0,2622950)
+        #更改为中国470MHz频段
+        self.freq = 470000000 + random.randint(0,8) * 200000 
         # for certain experiments override these and
         # choose some random frequences
+        
         if experiment == 1:
             self.freq = random.choice([860000000, 864000000, 868000000])
-        else:
-            self.freq = 860000000
+        elif experiment == 6:
+            self.freq = 470000000 + random.randint(0,8) * 200000 
 
+        
+        
         self.rectime = airtime(self.sf,self.cr,self.pl,self.bw)
         # denote if packet is collided
         self.collided = 0
@@ -417,8 +468,10 @@ class myPacket():
         if experiment != 3:
             global minsensi
             self.lost = self.rssi < minsensi
-            print "node {} bs {} lost {}".format(self.nodeid, self.bs, self.lost)
-
+            #print("self.rssi:",self.rssi, ",minsensi:", minsensi)
+            print("node {} bs {} lost {}".format(self.nodeid, self.bs, self.lost))
+        
+        print("nodeid:", self.nodeid, ",sf:", self.sf, ", freq:",self.freq,"distance: ", distance)
 
 #
 # main discrete event loop, runs for each node
@@ -440,22 +493,39 @@ def transmit(env,node):
         global nrBS
         for bs in range(0, nrBS):
            if (node in packetsAtBS[bs]):
-                print "ERROR: packet already in"
+                print("ERROR: packet already in")
            else:
                 # adding packet if no collision
                 if (checkcollision(node.packet[bs])==1):
                     node.packet[bs].collided = 1
                 else:
                     node.packet[bs].collided = 0
+                #print("Get nodeid: ", node.id, " in bs: ", bs, ",collided: ", node.packet[bs].collided)
                 packetsAtBS[bs].append(node)
                 node.packet[bs].addTime = env.now
                 node.packet[bs].seqNr = packetSeq
 
+                #增加一定比例的confirmed报文,downRate
+                if node.sent % downRate == 0:
+                    node.packet[bs].confrimed = True
+                
+                
+
         # take first packet rectime
+        '''
+        一个带有 yield 的函数就是一个 generator，它和普通函数不同，生成一个 generator 看起来像函数调用，
+        但不会执行任何函数代码，直到对其调用 next()（在 for 循环中会自动调用 next()）才开始执行。虽然执行流程仍按函数的流程执行，
+        但每执行到一个 yield 语句就会中断，并返回一个迭代值，下次执行时从 yield 的下一个语句继续执行。
+        看起来就好像一个函数在正常执行的过程中被 yield 中断了数次，每次中断都会通过 yield 返回当前的迭代值。
+        yield 的好处是显而易见的，把一个函数改写为一个 generator 就获得了迭代能力，
+        比起用类的实例保存状态来计算下一个 next() 的值，不仅代码简洁，而且执行流程异常清晰
+        '''
+        #node.packet[0].rectime 第一个报文的到达时间
         yield env.timeout(node.packet[0].rectime)
 
         # if packet did not collide, add it in list of received packets
         # unless it is already in
+        #记录丢失队列lostPackets、接收队列recPackets、和冲突队列collidedPackets
         for bs in range(0, nrBS):
             if node.packet[bs].lost:
                 lostPackets.append(node.packet[bs].seqNr)
@@ -463,6 +533,7 @@ def transmit(env,node):
                 if node.packet[bs].collided == 0:
                     packetsRecBS[bs].append(node.packet[bs].seqNr)
                     if (recPackets):
+                        # 不存在则添加到recPackets中
                         if (recPackets[-1] != node.packet[bs].seqNr):
                             recPackets.append(node.packet[bs].seqNr)
                     else:
@@ -473,6 +544,7 @@ def transmit(env,node):
 
         # complete packet has been received by base station
         # can remove it
+        #清空节点所保存的报文在各个基站上的表现
         for bs in range(0, nrBS):
             if (node in packetsAtBS[bs]):
                 packetsAtBS[bs].remove(node)
@@ -493,18 +565,18 @@ if len(sys.argv) >= 6:
     nrBS = int(sys.argv[5])
     if len(sys.argv) > 6:
         full_collision = bool(int(sys.argv[6]))
-    print "Nodes:", nrNodes
-    print "AvgSendTime (exp. distributed):",avgSendTime
-    print "Experiment: ", experiment
-    print "Simtime: ", simtime
-    print "nrBS: ", nrBS
+    print("Nodes:", nrNodes)
+    print("AvgSendTime (exp. distributed):",avgSendTime)
+    print("Experiment: ", experiment)
+    print("Simtime: ", simtime)
+    print("nrBS: ", nrBS)
     if (nrBS > 4 and nrBS!=8 and nrBS!=6 and nrBS != 24):
-        print "too many base stations, max 4 or 6 or 8 base stations"
+        print("too many base stations, max 4 or 6 or 8 base stations")
         exit(-1)
-    print "Full Collision: ", full_collision
+    print("Full Collision: ", full_collision)
 else:
-    print "usage: ./loraDir <nodes> <avgsend> <experiment> <simtime> <basestation> [collision]"
-    print "experiment 0 and 1 use 1 frequency only"
+    print("usage: ./loraDir <nodes> <avgsend> <experiment> <simtime> <basestation> [collision]")
+    print("experiment 0 and 1 use 1 frequency only")
     exit(-1)
 
 
@@ -539,17 +611,20 @@ sensi = np.array([sf7,sf8,sf9,sf10,sf11,sf12])
 
 ## figure out the minimal sensitivity for the given experiment
 minsensi = -200.0
+minsensi = sensi[5,2]
 if experiment in [0,1,4]:
     minsensi = sensi[5,2]  # 5th row is SF12, 2nd column is BW125
 elif experiment == 2:
     minsensi = -112.0   # no experiments, so value from datasheet
 elif experiment == [3, 5]:
     minsensi = np.amin(sensi) ## Experiment 3 can use any setting, so take minimum
-
+                                                                                                                           
+#Lpl 路径损耗
 Lpl = Ptx - minsensi
-print "amin", minsensi, "Lpl", Lpl
+print("amin", minsensi, "Lpl", Lpl)
+#最远距离Lpl(d) = Lpl(d0) + 10γ log(d/d0) + Xσ
 maxDist = d0*(math.e**((Lpl-Lpld0)/(10.0*gamma)))
-print "maxDist:", maxDist
+print("maxDist:", maxDist)
 
 # base station placement
 bsx = maxDist+10
@@ -563,18 +638,19 @@ maxBSReceives = 8
 
 
 maxX = 2 * maxDist * math.sin(60*(math.pi/180)) # == sqrt(3) * maxDist
-print "maxX ", maxX
+print("maxX ", maxX)
 maxY = 2 * maxDist * math.sin(30*(math.pi/180)) # == maxdist
-print "maxY", maxY
+print("maxY", maxY)
 
 
 # prepare graphics and add sink
 if (graphics == 1):
-    plt.ion()
+    #plt.ion()
     plt.figure()
     ax = plt.gcf().gca()
 
     ax.add_patch(Rectangle((0, 0), maxX, maxY, fill=None, alpha=1))
+    print("graphies add  ax.add_patch")
 
 # list of base stations
 bs = []
@@ -597,7 +673,7 @@ for i in range(0,nrBS):
 for i in range(0,nrNodes):
     # myNode takes period (in ms), base station id packetlen (in Bytes)
     # 1000000 = 16 min
-    node = myNode(i, avgSendTime,20)
+    node = myNode(i, avgSendTime,packetlen)
     nodes.append(node)
     env.process(transmit(env,node))
 
@@ -617,27 +693,29 @@ with open('basestation.txt', 'w') as bfile:
     for basestation in bs:
         bfile.write('{x} {y} {id}\n'.format(**vars(basestation)))
 
+print("plant grif ok. start simulation....")
 # start simulation
 env.run(until=simtime)
 
+print("end simulation...., print statistic")
 # print stats and save into file
 # print "nrCollisions ", nrCollisions
 # print list of received packets
 #print recPackets
-print "nr received packets", len(recPackets)
-print "nr collided packets", len(collidedPackets)
-print "nr lost packets", len(lostPackets)
+print("nr received packets", len(recPackets))
+print("nr collided packets", len(collidedPackets))
+print("nr lost packets", len(lostPackets))
 
 #print "sent packets: ", sent
 #print "sent packets-collisions: ", sent-nrCollisions
 #print "received packets: ", len(recPackets)
 for i in range(0,nrBS):
-    print "packets at BS",i, ":", len(packetsRecBS[i])
-print "sent packets: ", packetSeq
+    print("packets at BS",i, ":", len(packetsRecBS[i]))
+print("sent packets: ", packetSeq)
 
 # data extraction rate
 der = len(recPackets)/float(packetSeq)
-print "DER:", der
+print("DER:", der)
 #der = (nrReceived)/float(sent)
 #print "DER method 2:", der
 
@@ -648,7 +726,7 @@ if (graphics == 1):
 # save experiment data into a dat file that can be read by e.g. gnuplot
 # name of file would be:  exp0.dat for experiment 0
 fname = "exp" + str(experiment) + "BS" + str(nrBS) + ".dat"
-print fname
+print(fname)
 if os.path.isfile(fname):
     res = "\n" + str(nrNodes) + " " + str(der)
 else:
@@ -670,4 +748,4 @@ for i in range(0,nrNodes):
 #    print "sent ", nodes[i].sent
     sent = sent + nodes[i].sent
     energy = (energy + nodes[i].packet.rectime * mA * V * nodes[i].sent)/1000.0
-print "energy (in mJ): ", energy
+print("energy (in mJ): ", energy)
