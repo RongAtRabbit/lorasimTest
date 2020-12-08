@@ -79,18 +79,20 @@ full_collision = False
 
 sfstat = [0 for x in range(6)]
 
+
 #基站信道利用率统计
 bsState=[]
 
 minsensi = -200.0
 
-downlinkPst= 5
+downlinkPst= 10
 Ptx = 14
 gamma = 2.08    #路损系数
 d0 = 40.0
 #var = 1.28           # variance ignored for now
 var = 3.05
 Lpld0 = 127.41
+BsPtx = 14
 #d0=1000
 #Lpld0 = 128.95
 
@@ -124,6 +126,90 @@ sf11 = np.array([11,-134.5,-132.75,-128.75])
 sf12 = np.array([12,-137.25,-132.25,-132.25])
 
 bsNode = []
+
+#检查基站到终端的距离，确认是否会丢失
+def checkdownlost(packet):
+    nodeid = int(packet.nodeid)
+    bsid = packet.bs
+    #是否先计算node到bs的距离以及rssi
+    ##print("nodeid: ", packet.nodeid, ", bsid: ", bsid)
+    bsdist = np.sqrt((abs(nodes[nodeid].x - bsNode[bsid].x)**2) + (abs(nodes[nodeid].y - bsNode[bsid].y)**2))
+    Lpl = Lpld0 + 10*gamma*math.log10(bsdist/d0) + random.gauss(0, var)
+    Prx = BsPtx - GL - Lpl
+    packet.rssi = Prx
+    sfidx = packet.sf - 7
+    if (packet.rssi < sensi[sfidx, 2]):
+        packet.lost = 1
+        bsNode[packet.bs].downlostPkt += 1
+        return 1
+    return 0
+
+#
+# 检查下行碰撞
+# Note: called before a packet (or rather node) is inserted into the list 
+# 1. 检查当前发报文的终端 - 遍历所有基站当前接收到的报文，获取发报文的nodeid
+# 2. 计算终端到下行接收终端的距离的rssi，若rssi>minrssi
+# 3. 若2被满足，检查频率和sf确认是否会发生碰撞，导致下行报文丢失
+# 4. todo: 是否还是要检查当前下行报文与其他上行报文的碰撞可能性 - 计算从该基站发出到其他基站得到的rssi，并进行比较
+def checkdowncollision(packet):
+    col = 0 # flag needed since there might be several collisions for packet
+    # lost packets don't collide
+    #bsid = packet.bs
+    nodeid = int(packet.nodeid)
+    
+    checkedNode=[] #已经检查过的node列表
+    
+    #检查下行报文到接收终端与其他终端同时发出的上行报文的碰撞可能性
+    for bsid in range(nrBS):
+        if packetsAtBS[bsid]:
+            for other in packetsAtBS[bsid]:
+                otherid = other.id
+                if otherid == nodeid:
+                    continue
+                #确认是否检查过了
+                if otherid in checkedNode:
+                    continue
+                else:
+                    checkedNode.append(otherid)
+                #计算终端之间的距离
+                otherdist = np.sqrt((abs(other.x -nodes[nodeid].x)**2) + (abs(other.y -nodes[nodeid].y)**2))
+                #根据距离计算rssi
+                #print("otherdist: ", otherdist, ", d0:", d0, ", nodeid: ", nodeid, ", otherid:", otherid)
+                Lpl = Lpld0 + 10*gamma*math.log10(otherdist/d0) #+ random.gauss(0, var)
+                Prx = Ptx - GL - Lpl
+                otherrssi = Prx
+                #说明可以被接收到 - 进一步检查频率、时间、sf、功率
+                if otherrssi > minsensi:
+                    if frequencyCollision(packet, other.packet[packet.bs]) \
+                        and sfCollision(packet, other.packet[packet.bs]):
+                        packet.collided = 1
+                        #other.packet[packet.bs].collided = 1  # other also got lost, if it wasn't lost already
+                        col = 1
+                        #统计下行丢失
+                        bsNode[packet.bs].downcollisionpkt += 1
+                        break;
+                
+    #检查下行报文到其他基站与其他基站发生碰撞导致上行报文丢失的可能性
+    Lpl = Lpld0 + 10*gamma*math.log10(baseDist/d0) #+ random.gauss(0, var)
+    Prx = BsPtx - GL - Lpl
+    bsrssi = Prx
+    for bsid in range(nrBS):
+        if (bsid == packet.bs):
+            continue
+        if (bsrssi < minsensi):#不可达，不造成影响
+            continue
+        if packetsAtBS[bsid]:
+            for other in packetsAtBS[bsid]:
+                otherid = other.id
+                if otherid == nodeid:
+                    continue
+                #此处检查是否会影响其他终端丢包
+                if frequencyCollision(packet, other.packet[bsid]) \
+                        and sfCollision(packet, other.packet[bsid]):
+                        other.packet[packet.bs].collided = 1            
+                
+    #检查下行报文与其他基站下发的下行报文碰撞的可能性
+    return col
 
 def distanceSf():
     txpwr=14#dbm
@@ -391,6 +477,9 @@ class myBS():
         self.txtime = 0
         self.dropPkt = 0
         self.tx_lost =0
+
+        self.downlostPkt = 0 #下行丢包报文
+        self.downcollisionpkt = 0 #下行碰撞报文
         
         self.sfstat_lost = [0 for x in range(6)]
         self.sfstat_collision = [0 for x in range(6)]
@@ -735,8 +824,8 @@ def pickGw(env, node):
                 if (bestscore > (rssiscore+utilscore + chnlutilscore)):
                     bestscore = (rssiscore+utilscore + chnlutilscore)
                     pickgw = bsidx
-                    print("totScore:", bestscore, ",node[",node.id,"] pick BS:", pickgw," rssiscore: ", rssiscore,", rssi：[",delta_rssi,"]", node.packet[bsidx].cur_rssi, 
-                            ",gwuitil: ",utilscore,",chnlUtil[", chnl, "]:", chnlutilscore, ",SF: ", node.sf)     
+                    #print("totScore:", bestscore, ",node[",node.id,"] pick BS:", pickgw," rssiscore: ", rssiscore,", rssi：[",delta_rssi,"]", node.packet[bsidx].cur_rssi, 
+                    #        ",gwuitil: ",utilscore,",chnlUtil[", chnl, "]:", chnlutilscore, ",SF: ", node.sf)     
         else:
             pickgw = node.bs.id
 
@@ -790,6 +879,24 @@ def processStatGw(env, bs):
             bs[i].util_stat = (bs[i].acttime - bs[i].last_acttime)*100/stat_period
             #bs[i].
 
+#下行处理过程
+def processdown(env, node):
+    bsidx = pickGw(env, node)
+    print("confirmed pkt choose bsidx: ", bsidx)
+    packet = node.packet[bsidx]
+    node.downgw = bsidx
+    if (bsidx >= 0):               
+        bsNode[bsidx].downCnt +=1
+        bsState[bsidx] = 1#set to tx mode
+        node.packet[bsidx].addTime = env.now
+        toa_time = airtime(packet.sf, packet.cr, packet.pl, packet.bw)
+        packet.rectime = toa_time
+        checkdownlost(packet)
+        checkdowncollision(packet)
+        yield env.timeout(toa_time)
+        bsNode[bsidx].tx_util += toa_time
+        bsState[bsidx] = 0 #reset bs stat to rx mode
+        statBsWorkTime(bsidx, packet.chnl, env.now, (env.now + toa_time), 1)
 #
 # main discrete event loop, runs for each node
 # a global list of packet being processed at the gateway
@@ -893,18 +1000,26 @@ def transmit(env,node):
         # can remove it
 
         #pick downlink gw
-        if (confirmed):
+        #print("Get nodeid:", node.id, "confirmed: ", confirmed)
+        if (confirmed == True):
+            #processdown(env, node)
             bsidx = pickGw(env, node)
+            #print("confirmed pkt choose bsidx: ", bsidx)
             packet = node.packet[bsidx]
             node.downgw = bsidx
             if (bsidx >= 0):               
                 bsNode[bsidx].downCnt +=1
                 bsState[bsidx] = 1#set to tx mode
+                node.packet[bsidx].addTime = env.now
                 toa_time = airtime(packet.sf, packet.cr, packet.pl, packet.bw)
+                packet.rectime = toa_time
+                checkdownlost(packet)
+                checkdowncollision(packet)
                 yield env.timeout(toa_time)
                 bsNode[bsidx].tx_util += toa_time
                 bsState[bsidx] = 0 #reset bs stat to rx mode
-                statBsWorkTime(bsidx, chnl, env.now, (env.now + toa_time), 1)
+                statBsWorkTime(bsidx, packet.chnl, env.now, (env.now + toa_time), 1)
+            #print("process nodeid: ", node.id, "down ok")
         
         #报文处理完成，重置状态
         for bsidx in range(0, nrBS):                    
@@ -952,7 +1067,7 @@ if len(sys.argv) == 10:
     print("baseDist: ", baseDist)   # x-distance between the two base stations
 
 else:
-    print("usage: ./directionalLoraIntf.py <nodes> <avgsend> <experiment> <simtime> <nrBS> <collision> <directionality> <networks> <basedist>")
+    print("usage: ./directionalLoraIntf.py <nodes> <avgsend> <experiment> <simtime> <nrBS> <collision> <directionality> <planid> <basedist>")
     print("experiment 0 and 1 use 1 frequency only")
     exit(-1)
 
@@ -1058,9 +1173,9 @@ for j in range(0,nrBS):
         # create nrNodes for each base station
         #if (nodeid == -1):
          #   nodeid = j * plan[planid][j] + i
-        nodeid = nodeid+ 1
         #node = myNode(i*nrBS+j, avgSendTime,20,bsNode[j])
         node = myNode(nodeid, avgSendTime,20,bsNode[j], fileExist, x, y)
+        nodeid = nodeid+ 1
         nodes.append(node)
         
         # when we add directionality, we update the RSSI here
@@ -1220,6 +1335,8 @@ for i in range(0, nrBS):
     sumder = sumder + der[i]
     print("Tx Drop Bs[",i,"]:", bsNode[i].tx_lost)
     print("downCnt BS[",i,"]:", bsNode[i].downCnt)
+    print("downLostCnt BS[",i,"]:", bsNode[i].downlostPkt)
+    print("downCollisionCnt BS[",i,"]:", bsNode[i].downcollisionpkt)
     print("channel Util BS[",i,"]:", [x/simtime for x in bsNode[i].chnelUtil])
     
 '''    
@@ -1238,14 +1355,19 @@ print("DER with 1 network:", derALL)
 print("Node Num:", nrNodes,", Distribute: ", plan[planid])
 authlog = ["","Signal First", "Weight-Mean","Load-Balance", "Nothting"]
 print("Downlink Routing Algorithm: ", authlog[experiment])
-print("----------------------------------------------------------------")
-print('|{:^5s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|'.format('基站ID','上行负载(%)','下行负载 (%)','总负载(%)','DER(%)'))
+print("-------------------------------------------------------------------------------------------------------------------")
+print('|{:^5s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|'.format('基站ID','上行负载(%)','下行负载 (%)','总负载(%)','DER(%)','下行丢包(%)', '下行碰撞(%)'))
 
 #directionalLoraIntf.py 1000 1000000 2 15000000 3 2 0 0 450
 
 for i in range(0, nrBS):
-    print('|{:^7d}|{:^14.2f}|{:^14.2f}|{:^13.2f}|{:^10.2f}|'.format(i, bsNode[i].rx_time *100/simtime, bsNode[i].tx_util*100/simtime, bsNode[i].work_time/simtime*100, der[i]*100))
-print("----------------------------------------------------------------")
+    downlostPst = 0
+    downcolliPst = 0
+    if (bsNode[i].downlostPkt):
+        downlostPst = bsNode[i].downlostPkt / bsNode[i].downCnt
+        downcolliPst = bsNode[i].downcollisionpkt / bsNode[i].downCnt
+    print('|{:^7d}|{:^14.2f}|{:^14.2f}|{:^13.2f}|{:^10.2f}|{:^13.2f}|{:^13.2f}|'.format(i, bsNode[i].rx_time *100/simtime, bsNode[i].tx_util*100/simtime, bsNode[i].work_time/simtime*100, der[i]*100, downlostPst * 100, downcolliPst* 100))
+print("--------------------------------------------------------------------------------------------------------------------")
 
 
 # this can be done to keep graphics visible
